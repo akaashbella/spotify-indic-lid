@@ -46,6 +46,7 @@ Thumbs.db
 spotify_lid_progress.db
 *.db
 needs_review.csv
+indian_songs.csv
 models/
 IndicLID/
 
