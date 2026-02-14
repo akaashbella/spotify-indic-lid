@@ -16,7 +16,6 @@ Filters your Spotify **Liked Songs** into a playlist (**Indian Collection**) usi
 
 3. **Run**
    - Local: `pip install -r requirements.txt` then `python main.py`.
-   - HPC: configure `submit_job.sh` (set `#SBATCH --account=...`) and `sbatch submit_job.sh`.
 
 ## Behavior
 
