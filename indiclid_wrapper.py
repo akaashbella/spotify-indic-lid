@@ -127,3 +127,23 @@ class IndicLIDWrapper:
             if lang in SOUTH_ASIAN_CODES and conf > best_conf:
                 best_lang, best_conf = lang, conf
         return best_lang, best_conf
+
+    def get_south_asian_language_confidences(self, lyrics: str) -> dict[str, float]:
+        """
+        Run LID per line and return max confidence per South Asian language code.
+        Enables multi-label assignment: e.g. {"hin_Latn": 0.9, "tam_Latn": 0.85}
+        so a song can be assigned to both Hindi and Tamil playlists.
+        """
+        if not (lyrics and lyrics.strip()):
+            return {}
+        self._ensure_loaded()
+        lines = [ln.strip() for ln in re.split(r"[\n]+", lyrics.strip()) if ln.strip()]
+        if not lines:
+            return {}
+        line_results = self._model.batch_predict(lines, batch_size=min(32, len(lines)))
+        max_conf: dict[str, float] = {}
+        for r in line_results:
+            lang, conf = r[1], self._result_to_confidence(r)
+            if lang in SOUTH_ASIAN_CODES:
+                max_conf[lang] = max(max_conf.get(lang, 0.0), conf)
+        return max_conf

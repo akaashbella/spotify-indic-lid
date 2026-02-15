@@ -5,6 +5,7 @@ Uses Spotify API, Genius lyrics, and AI4Bharat IndicLID. Resume-safe via SQLite.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -32,7 +33,14 @@ CONFIG = {
     "genius_max_retries": int(os.environ.get("GENIUS_MAX_RETRIES", "5")),
     "spotify_batch_size": 100,
     "needs_review_csv": "needs_review.csv",
+    "songs_csv": os.environ.get("SPOTIFY_SONGS_CSV", "indian_songs.csv"),
     "model_dir": os.environ.get("INDICLID_MODEL_DIR"),
+}
+
+# One playlist per language; each language can have multiple script codes (e.g. Hindi = Devanagari + Latin)
+LANGUAGE_PLAYLISTS = {
+    "Hindi": ["hin_Deva", "hin_Latn"],
+    "Tamil": ["tam_Tamil", "tam_Latn"],
 }
 
 # Spotify OAuth scopes
@@ -63,11 +71,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             lid_lang TEXT,
             lid_confidence REAL,
             lid_model TEXT,
-            status TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending',
+            languages TEXT,
+            language_confidences TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status);
         CREATE INDEX IF NOT EXISTS idx_tracks_lyrics ON tracks(lyrics);
     """)
+    # Migration: add new columns if table already existed
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(tracks)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "languages" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN languages TEXT")
+    if "language_confidences" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN language_confidences TEXT")
+    conn.commit()
 
 
 def get_conn() -> sqlite3.Connection:
@@ -116,17 +135,32 @@ def upsert_track(
     conn.commit()
 
 
-def update_lid(
+def update_language_result(
     conn: sqlite3.Connection,
     track_id: str,
-    lid_lang: str,
-    lid_confidence: float,
-    lid_model: str,
-    status: str,
+    language_confidences: dict[str, float],
 ) -> None:
+    """Store per-language confidences and set status from thresholds."""
+    if not language_confidences:
+        conn.execute(
+            "UPDATE tracks SET languages=?, language_confidences=?, lid_lang=?, lid_confidence=?, status=? WHERE track_id=?",
+            ("[]", "{}", "other", 0.0, "skip", track_id),
+        )
+        conn.commit()
+        return
+    # Primary lang for backward compat: best South Asian
+    best_lang = max(language_confidences, key=language_confidences.get)
+    best_conf = language_confidences[best_lang]
+    languages = list(language_confidences.keys())
+    if any(c >= CONFIG["confidence_auto_add"] for c in language_confidences.values()):
+        status = "add"
+    elif any(CONFIG["confidence_review_min"] <= c <= CONFIG["confidence_review_max"] for c in language_confidences.values()):
+        status = "review"
+    else:
+        status = "skip"
     conn.execute(
-        "UPDATE tracks SET lid_lang=?, lid_confidence=?, lid_model=?, status=? WHERE track_id=?",
-        (lid_lang, lid_confidence, lid_model, status, track_id),
+        "UPDATE tracks SET languages=?, language_confidences=?, lid_lang=?, lid_confidence=?, lid_model=?, status=? WHERE track_id=?",
+        (json.dumps(languages), json.dumps(language_confidences), best_lang, best_conf, "IndicLID", status, track_id),
     )
     conn.commit()
 
@@ -142,15 +176,37 @@ def get_tracks_missing_lyrics(conn: sqlite3.Connection) -> list[tuple[str, str, 
 def get_tracks_missing_lid(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     cur = conn.cursor()
     cur.execute(
-        "SELECT track_id, lyrics FROM tracks WHERE lyrics IS NOT NULL AND lyrics != '' AND lid_lang IS NULL"
+        "SELECT track_id, lyrics FROM tracks WHERE lyrics IS NOT NULL AND lyrics != '' AND (language_confidences IS NULL OR language_confidences = '')"
     )
     return cur.fetchall()
 
 
-def get_tracks_to_add(conn: sqlite3.Connection) -> list[str]:
+def get_track_uris_for_language(conn: sqlite3.Connection, lang_codes: list[str]) -> list[str]:
+    """Track IDs that have any of the given lang codes with confidence >= auto_add threshold."""
     cur = conn.cursor()
-    cur.execute("SELECT track_id FROM tracks WHERE status = 'add' ORDER BY added_at")
-    return [r[0] for r in cur.fetchall()]
+    out = []
+    cur.execute(
+        "SELECT track_id, language_confidences FROM tracks WHERE status IN ('add', 'review') AND language_confidences IS NOT NULL AND language_confidences != ''"
+    )
+    for track_id, j in cur.fetchall():
+        if not j:
+            continue
+        try:
+            confs = json.loads(j)
+        except json.JSONDecodeError:
+            continue
+        if any(confs.get(lc, 0) >= CONFIG["confidence_auto_add"] for lc in lang_codes):
+            out.append(track_id)
+    return out
+
+
+def get_all_tracks_with_languages(conn: sqlite3.Connection) -> list[tuple]:
+    """All tracks that have at least one South Asian language (add or review). For CSV export."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT track_id, name, artists, added_at, languages, language_confidences FROM tracks WHERE status IN ('add', 'review') AND language_confidences IS NOT NULL AND language_confidences != '' ORDER BY added_at"
+    )
+    return cur.fetchall()
 
 
 def get_tracks_for_review(conn: sqlite3.Connection) -> list[tuple]:
@@ -236,13 +292,17 @@ def fetch_all_liked_tracks(sp) -> list[dict]:
     return tracks
 
 
-def find_or_create_playlist(sp, name: str):
+def find_or_create_playlist(sp, name: str, description: str = "South Asian tracks from Liked Songs"):
     user_id = sp.current_user()["id"]
     playlists = sp.user_playlists(user_id, limit=50)
-    for p in playlists.get("items", []):
-        if p.get("name") == name:
-            return p["id"]
-    pl = sp.user_playlist_create(user_id, name, public=False, description="South Asian (Hindi/Tamil) tracks from Liked Songs")
+    while playlists:
+        for p in playlists.get("items", []):
+            if p.get("name") == name:
+                return p["id"]
+        if not playlists.get("next"):
+            break
+        playlists = sp.next(playlists)
+    pl = sp.user_playlist_create(user_id, name, public=False, description=description)
     return pl["id"]
 
 
@@ -263,19 +323,6 @@ def replace_playlist_tracks(sp, playlist_id: str, track_uris: list[str]) -> None
         sp.playlist_add_items(playlist_id, batch)
         if i + batch_size < len(track_uris):
             time.sleep(0.5)
-
-
-# -----------------------------------------------------------------------------
-# LID and status logic
-# -----------------------------------------------------------------------------
-def classify_status(lang: str, confidence: float) -> str:
-    if lang not in SOUTH_ASIAN_CODES:
-        return "skip"
-    if confidence >= CONFIG["confidence_auto_add"]:
-        return "add"
-    if CONFIG["confidence_review_min"] <= confidence <= CONFIG["confidence_review_max"]:
-        return "review"
-    return "skip"
 
 
 # -----------------------------------------------------------------------------
@@ -326,11 +373,10 @@ def run():
     logger.info("Running IndicLID on %d tracks...", len(to_lid))
     for track_id, lyrics in tqdm(to_lid, desc="LID"):
         if not lyrics or not lyrics.strip():
-            update_lid(conn, track_id, "other", 0.0, "", "skip")
+            update_language_result(conn, track_id, {})
             continue
-        lang, confidence = lid.get_south_asian_confidence(lyrics)
-        status = classify_status(lang, confidence)
-        update_lid(conn, track_id, lang, confidence, "IndicLID", status)
+        confidences = lid.get_south_asian_language_confidences(lyrics)
+        update_language_result(conn, track_id, confidences)
     conn.commit()
 
     # ----- 4) Needs-review CSV -----
@@ -343,15 +389,49 @@ def run():
         df.to_csv(CONFIG["needs_review_csv"], index=False)
         logger.info("Wrote %d rows to %s", len(df), CONFIG["needs_review_csv"])
 
-    # ----- 5) Create/update playlist and add tracks -----
-    to_add = get_tracks_to_add(conn)
-    if to_add:
-        playlist_id = find_or_create_playlist(sp, CONFIG["playlist_name"])
-        uris = [f"spotify:track:{tid}" for tid in to_add]
+    # ----- 5) CSV of all Indian-language songs -----
+    rows = get_all_tracks_with_languages(conn)
+    if rows:
+        # Human-readable language names for CSV
+        lang_display = {"hin_Deva": "Hindi (Devanagari)", "hin_Latn": "Hindi (Latin)", "tam_Tamil": "Tamil", "tam_Latn": "Tamil (Latin)"}
+        csv_rows = []
+        for track_id, name, artists, added_at, languages_json, confidences_json in rows:
+            try:
+                langs = json.loads(languages_json or "[]")
+                confs = json.loads(confidences_json or "{}")
+            except json.JSONDecodeError:
+                langs, confs = [], {}
+            hindi_conf = max(confs.get("hin_Deva", 0), confs.get("hin_Latn", 0))
+            tamil_conf = max(confs.get("tam_Tamil", 0), confs.get("tam_Latn", 0))
+            in_hindi = any(confs.get(lc, 0) >= CONFIG["confidence_auto_add"] for lc in LANGUAGE_PLAYLISTS["Hindi"])
+            in_tamil = any(confs.get(lc, 0) >= CONFIG["confidence_auto_add"] for lc in LANGUAGE_PLAYLISTS["Tamil"])
+            languages_str = ", ".join(lang_display.get(l, l) for l in langs)
+            csv_rows.append({
+                "track_id": track_id,
+                "name": name,
+                "artists": artists,
+                "added_at": added_at,
+                "languages": languages_str,
+                "hindi_confidence": round(hindi_conf, 4),
+                "tamil_confidence": round(tamil_conf, 4),
+                "in_hindi_playlist": in_hindi,
+                "in_tamil_playlist": in_tamil,
+            })
+        df = pd.DataFrame(csv_rows)
+        df.to_csv(CONFIG["songs_csv"], index=False)
+        logger.info("Wrote %d songs to %s", len(df), CONFIG["songs_csv"])
+
+    # ----- 6) Per-language playlists -----
+    for lang_name, lang_codes in LANGUAGE_PLAYLISTS.items():
+        track_ids = get_track_uris_for_language(conn, lang_codes)
+        if not track_ids:
+            logger.info("No tracks for '%s'; skipping playlist.", lang_name)
+            continue
+        playlist_title = f"{CONFIG['playlist_name']} - {lang_name}"
+        playlist_id = find_or_create_playlist(sp, playlist_title, description=f"{lang_name} tracks from Liked Songs")
+        uris = [f"spotify:track:{tid}" for tid in track_ids]
         replace_playlist_tracks(sp, playlist_id, uris)
-        logger.info("Updated playlist '%s' with %d tracks.", CONFIG["playlist_name"], len(uris))
-    else:
-        logger.info("No tracks to add (confidence >= %.2f). Check needs_review.csv for 0.4–0.7.", CONFIG["confidence_auto_add"])
+        logger.info("Updated playlist '%s' with %d tracks.", playlist_title, len(uris))
 
     conn.close()
     logger.info("Done.")
