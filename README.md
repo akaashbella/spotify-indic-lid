@@ -1,4 +1,4 @@
-# Spotify South Asian (Hindi/Tamil) Playlist Pipeline
+# Spotify Indian Languages Playlist Pipeline
 
 Filters your Spotify **Liked Songs** into **per-language playlists** using language detection (AI4Bharat IndicLID). Supports **Hindi, Tamil, Telugu, Malayalam, and Kannada** in both native and Romanized script (e.g. Hinglish, Tanglish). Songs with multiple Indian languages appear in each corresponding playlist.
 
@@ -16,7 +16,19 @@ Filters your Spotify **Liked Songs** into **per-language playlists** using langu
 
 3. **Run**
    - Local: `pip install -r requirements.txt` then `python main.py`.
-   - **Headless / high-performance clusters:** Run once locally so Spotify creates a `.cache` file; upload `.cache` and `.env` to the project on your cluster. See **Setup on a headless cluster** in `requirements.txt` for the exact IndicLID directory layout.
+   - **Headless / high-performance clusters:** See **Before running on a cluster** below.
+
+### Before running on a cluster
+
+Cluster nodes typically have no browser, so do this once locally, then upload to the cluster:
+
+1. **Spotify auth:** Run `python main.py` on your laptop until you see authentication succeed. This creates a **`.cache`** file in the project folder.
+2. **Upload to cluster:** Copy the project to the cluster including the **`.cache`** file and your **`.env`**.
+3. **In `.env` on the cluster**, set:
+   - `SPOTIFY_CACHE_PATH=.cache` (so the script uses the token file you uploaded).
+   - `INDICLID_MODEL_DIR=/absolute/path/to/models` (path where you extracted the IndicLID model files on the cluster).
+
+See **Setup on a headless cluster** in `requirements.txt` for the exact IndicLID directory layout.
 
 ## Behavior
 
