@@ -36,4 +36,24 @@ fasttext>=0.9.2; sys_platform == "win32"
 #      models/indiclid-ftr/model_baseline_roman.bin
 #      models/indiclid-bert/basline_nn_simple.pt
 #
-# 3. (Optional) On HPC, use INDICLID_MODEL_DIR=$SCRATCH/indiclid-models or similar.
+# 3. (Optional) On a cluster, use INDICLID_MODEL_DIR=$SCRATCH/indiclid-models or similar.
+#
+# ---------------------------------------------------------------
+# Setup on a headless cluster (high-performance computing) – follow exactly
+# ---------------------------------------------------------------
+# - Directory layout: the wrapper expects IndicLID at project root, i.e.:
+#     project/
+#       main.py
+#       indiclid_wrapper.py
+#       IndicLID/           <-- clone here (git clone https://github.com/AI4Bharat/IndicLID.git)
+#         Inference/
+#           ai4bharat/
+#             IndicLID.py
+#       models/
+#         indiclid-ftn/
+#         indiclid-ftr/
+#         indiclid-bert/
+# - Spotify auth (no browser on headless nodes): run `python main.py` once on your local machine.
+#   This creates a `.cache` file. Upload that `.cache` file to the project root on your cluster
+#   (same folder as main.py). The script uses cache_path=".cache" so it will read the
+#   token from this file and not prompt for a browser.

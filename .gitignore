@@ -1,6 +1,7 @@
 # Environment and secrets
 .env
 .env.local
+.cache
 *.pem
 
 # Python
@@ -50,7 +51,7 @@ indian_songs.csv
 models/
 IndicLID/
 
-# Slurm / HPC
+# Batch / cluster job logs (e.g. Slurm)
 spotify_lid_*.out
 spotify_lid_*.err
 *.out

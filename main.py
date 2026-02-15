@@ -21,7 +21,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
-# Config (env vars preferred for HPC)
+# Config (env vars preferred for cluster runs)
 # -----------------------------------------------------------------------------
 CONFIG = {
     "db_path": os.environ.get("SPOTIFY_LID_DB", "spotify_lid_progress.db"),
@@ -29,7 +29,7 @@ CONFIG = {
     "confidence_auto_add": float(os.environ.get("CONFIDENCE_AUTO_ADD", "0.8")),
     "confidence_review_min": float(os.environ.get("CONFIDENCE_REVIEW_MIN", "0.4")),
     "confidence_review_max": float(os.environ.get("CONFIDENCE_REVIEW_MAX", "0.7")),
-    "genius_delay": float(os.environ.get("GENIUS_DELAY", "0.5")),
+    "genius_delay": float(os.environ.get("GENIUS_DELAY", "1.2")),
     "genius_max_retries": int(os.environ.get("GENIUS_MAX_RETRIES", "5")),
     "spotify_batch_size": 100,
     "needs_review_csv": "needs_review.csv",
@@ -37,17 +37,18 @@ CONFIG = {
     "model_dir": os.environ.get("INDICLID_MODEL_DIR"),
 }
 
-# One playlist per language; each language can have multiple script codes (e.g. Hindi = Devanagari + Latin)
+# One playlist per language; each language can have multiple script codes (native + Latin/romanized).
+# Covers 5 major Indian languages: Hindi, Tamil, Telugu, Malayalam, Kannada.
 LANGUAGE_PLAYLISTS = {
     "Hindi": ["hin_Deva", "hin_Latn"],
     "Tamil": ["tam_Tamil", "tam_Latn"],
+    "Telugu": ["tel_Telu", "tel_Latn"],
+    "Malayalam": ["mal_Mlym", "mal_Latn"],
+    "Kannada": ["kan_Knda", "kan_Latn"],
 }
 
 # Spotify OAuth scopes
 SCOPE = "user-library-read playlist-modify-public playlist-modify-private"
-
-# IndicLID South Asian codes (Hindi + Tamil, native + romanized)
-SOUTH_ASIAN_CODES = {"hin_Deva", "hin_Latn", "tam_Tamil", "tam_Latn"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -249,16 +250,18 @@ def get_spotify_client():
     client_id = os.environ.get("SPOTIFY_CLIENT_ID")
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
     redirect_uri = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:9090")
+    cache_path = os.environ.get("SPOTIFY_CACHE_PATH", ".cache")
     if not client_id or not client_secret:
         raise RuntimeError("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET")
-    return spotipy.Spotify(
-        auth_manager=SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
-            scope=SCOPE,
-        )
+    # Explicit cache_path: run once locally to create .cache, then upload it to your cluster (headless nodes have no browser).
+    auth_manager = SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        scope=SCOPE,
+        cache_path=cache_path,
     )
+    return spotipy.Spotify(auth_manager=auth_manager)
 
 
 def fetch_all_liked_tracks(sp) -> list[dict]:
@@ -364,7 +367,7 @@ def run():
 
     # ----- 3) IndicLID: run LID and set status -----
     try:
-        from indiclid_wrapper import IndicLIDWrapper, SOUTH_ASIAN_CODES as _  # noqa: F401
+        from indiclid_wrapper import IndicLIDWrapper
     except Exception as e:
         logger.error("IndicLID not available: %s. See requirements.txt.", e)
         return
@@ -392,8 +395,14 @@ def run():
     # ----- 5) CSV of all Indian-language songs -----
     rows = get_all_tracks_with_languages(conn)
     if rows:
-        # Human-readable language names for CSV
-        lang_display = {"hin_Deva": "Hindi (Devanagari)", "hin_Latn": "Hindi (Latin)", "tam_Tamil": "Tamil", "tam_Latn": "Tamil (Latin)"}
+        # Human-readable names for IndicLID codes (native + Latin)
+        lang_display = {
+            "hin_Deva": "Hindi (Devanagari)", "hin_Latn": "Hindi (Latin)",
+            "tam_Tamil": "Tamil", "tam_Latn": "Tamil (Latin)",
+            "tel_Telu": "Telugu", "tel_Latn": "Telugu (Latin)",
+            "mal_Mlym": "Malayalam", "mal_Latn": "Malayalam (Latin)",
+            "kan_Knda": "Kannada", "kan_Latn": "Kannada (Latin)",
+        }
         csv_rows = []
         for track_id, name, artists, added_at, languages_json, confidences_json in rows:
             try:
@@ -401,22 +410,19 @@ def run():
                 confs = json.loads(confidences_json or "{}")
             except json.JSONDecodeError:
                 langs, confs = [], {}
-            hindi_conf = max(confs.get("hin_Deva", 0), confs.get("hin_Latn", 0))
-            tamil_conf = max(confs.get("tam_Tamil", 0), confs.get("tam_Latn", 0))
-            in_hindi = any(confs.get(lc, 0) >= CONFIG["confidence_auto_add"] for lc in LANGUAGE_PLAYLISTS["Hindi"])
-            in_tamil = any(confs.get(lc, 0) >= CONFIG["confidence_auto_add"] for lc in LANGUAGE_PLAYLISTS["Tamil"])
             languages_str = ", ".join(lang_display.get(l, l) for l in langs)
-            csv_rows.append({
+            row = {
                 "track_id": track_id,
                 "name": name,
                 "artists": artists,
                 "added_at": added_at,
                 "languages": languages_str,
-                "hindi_confidence": round(hindi_conf, 4),
-                "tamil_confidence": round(tamil_conf, 4),
-                "in_hindi_playlist": in_hindi,
-                "in_tamil_playlist": in_tamil,
-            })
+            }
+            for lang_name, lang_codes in LANGUAGE_PLAYLISTS.items():
+                key = lang_name.lower()
+                row[f"{key}_confidence"] = round(max(confs.get(lc, 0) for lc in lang_codes), 4)
+                row[f"in_{key}_playlist"] = any(confs.get(lc, 0) >= CONFIG["confidence_auto_add"] for lc in lang_codes)
+            csv_rows.append(row)
         df = pd.DataFrame(csv_rows)
         df.to_csv(CONFIG["songs_csv"], index=False)
         logger.info("Wrote %d songs to %s", len(df), CONFIG["songs_csv"])

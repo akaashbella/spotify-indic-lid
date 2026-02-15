@@ -1,5 +1,6 @@
 """
-Thin wrapper around AI4Bharat IndicLID for South Asian (Hindi/Tamil) LID.
+Thin wrapper around AI4Bharat IndicLID for major Indian language LID.
+Supports Hindi, Tamil, Telugu, Malayalam, Kannada (native + romanized).
 Uses the full two-stage model (FTR + BERT) when available; supports custom model_dir.
 """
 from __future__ import annotations
@@ -19,8 +20,14 @@ else:
 import torch
 import re
 
-# South Asian (Hindi + Tamil) language codes we care about (native + romanized)
-SOUTH_ASIAN_CODES = {"hin_Deva", "hin_Latn", "tam_Tamil", "tam_Latn"}
+# Major Indian language codes we detect (native + romanized): Hindi, Tamil, Telugu, Malayalam, Kannada
+SOUTH_ASIAN_CODES = {
+    "hin_Deva", "hin_Latn",   # Hindi
+    "tam_Tamil", "tam_Latn",  # Tamil
+    "tel_Telu", "tel_Latn",   # Telugu
+    "mal_Mlym", "mal_Latn",  # Malayalam
+    "kan_Knda", "kan_Latn",  # Kannada
+}
 
 
 def _softmax_logit(logit: float, all_logits: list[float]) -> float:
@@ -66,6 +73,10 @@ class IndicLIDWrapper:
             )
         finally:
             os.chdir(orig_cwd)
+        # Log device so users on GPU clusters can confirm the model uses the GPU (IndicLID sets device in __init__)
+        device = str(getattr(self._model, "device", "unknown"))
+        import logging
+        logging.getLogger(__name__).info("IndicLID using device: %s (CUDA available: %s)", device, torch.cuda.is_available())
 
     def _result_to_confidence(self, result: tuple) -> float:
         """Convert (text, lang_code, score, model_name) to confidence in [0,1]."""
@@ -103,30 +114,15 @@ class IndicLIDWrapper:
 
     def get_south_asian_confidence(self, lyrics: str) -> tuple[str, float]:
         """
-        For mixed English/Hindi or English/Tamil lyrics, return the best South Asian
-        (Hindi/Tamil) label and confidence. Runs on full text first; if top prediction
-        is not South Asian, runs per-line and returns max South Asian confidence.
+        Always compute max South Asian confidence across all lines (no full-text shortcut).
+        Many Indian songs use English for the chorus or heavy Hinglish; if we only checked
+        full-text first, we could miss tracks where South Asian content is present but not dominant.
         """
-        if not (lyrics and lyrics.strip()):
+        confidences = self.get_south_asian_language_confidences(lyrics)
+        if not confidences:
             return "other", 0.0
-        self._ensure_loaded()
-        text = lyrics.strip()
-        # First try full text
-        results = self._model.batch_predict([text], batch_size=1)
-        lang, conf = results[0][1], self._result_to_confidence(results[0])
-        if lang in SOUTH_ASIAN_CODES:
-            return lang, conf
-        # Mixed: run per-line and take max South Asian confidence
-        lines = [ln.strip() for ln in re.split(r"[\n]+", text) if ln.strip()]
-        if not lines:
-            return "other", 0.0
-        line_results = self._model.batch_predict(lines, batch_size=min(32, len(lines)))
-        best_lang, best_conf = "other", 0.0
-        for r in line_results:
-            lang, conf = r[1], self._result_to_confidence(r)
-            if lang in SOUTH_ASIAN_CODES and conf > best_conf:
-                best_lang, best_conf = lang, conf
-        return best_lang, best_conf
+        best_lang = max(confidences, key=confidences.get)
+        return best_lang, confidences[best_lang]
 
     def get_south_asian_language_confidences(self, lyrics: str) -> dict[str, float]:
         """
